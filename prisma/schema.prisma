@@ -1,0 +1,75 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TournamentStatus {
+  SCHEDULED
+  FINALIZED
+}
+
+model Tournament {
+  id        String           @id @default(uuid())
+  name      String
+  startsAt  DateTime
+  endsAt    DateTime
+  status    TournamentStatus @default(SCHEDULED)
+  createdAt DateTime         @default(now())
+
+  bets       TournamentBet[]
+  placements TournamentPlacement[]
+
+  // Drives the active-tournament lookup on every bet ingest.
+  @@index([startsAt, endsAt])
+}
+
+model Bet {
+  id            String   @id @default(uuid())
+  externalBetId String   @unique
+  playerId      String
+  amount        Int
+  currency      String
+  createdAt     DateTime
+  ingestedAt    DateTime @default(now())
+
+  tournamentBets TournamentBet[]
+
+  @@index([playerId])
+}
+
+/// Ledger of accepted bets per tournament. The unique constraint below is the
+/// entire idempotency guarantee: a replayed externalBetId cannot produce a
+/// second row, so it cannot produce a second ZINCRBY.
+model TournamentBet {
+  id            String   @id @default(uuid())
+  tournamentId  String
+  betId         String
+  externalBetId String
+  playerId      String
+  amount        Int
+  createdAt     DateTime @default(now())
+
+  tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  bet        Bet        @relation(fields: [betId], references: [id], onDelete: Cascade)
+
+  @@unique([tournamentId, externalBetId])
+  @@index([tournamentId, playerId])
+}
+
+/// Final placements, frozen by the snapshot job after endsAt.
+model TournamentPlacement {
+  tournamentId String
+  playerId     String
+  score        Int
+  rank         Int
+  createdAt    DateTime @default(now())
+
+  tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  @@id([tournamentId, playerId])
+  @@index([tournamentId, rank])
+}
