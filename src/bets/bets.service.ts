@@ -24,6 +24,14 @@ interface BetRow {
   amount: number;
 }
 
+/** One row per tournament whose window contains the bet, carrying both its
+ *  status and whether *this* call was the one that inserted the ledger row. */
+interface MatchedTournamentRow {
+  tournamentId: string;
+  status: string;
+  inserted: boolean;
+}
+
 @Injectable()
 export class BetsService {
   private readonly logger = new Logger(BetsService.name);
@@ -54,62 +62,77 @@ export class BetsService {
           RETURNING "id", "externalBetId", "playerId", "amount"
         `;
 
-        // 2. Every tournament whose window contains the bet's *event* time.
-        //    A bet can legitimately land in several overlapping tournaments.
-        const matching = await tx.tournament.findMany({
-          where: {
-            startsAt: { lte: dto.createdAt },
-            endsAt: { gte: dto.createdAt },
-          },
-          select: { id: true, status: true },
-        });
-
-        // 3. Fan out. One statement does the window match, the fan-out and the
-        //    dedupe atomically: ON CONFLICT DO NOTHING lets the unique index
-        //    decide what counts, and RETURNING tells us exactly which rows were
-        //    genuinely inserted. A replay inserts nothing and returns nothing,
-        //    so it can never reach the ZINCRBY below.
+        // 2. Window match, fan-out and dedupe, in one statement.
+        //
+        //    `matched` is every tournament whose window contains the bet's
+        //    *event* time — a bet can legitimately land in several overlapping
+        //    tournaments. `ins` fans out across exactly that set, and
+        //    ON CONFLICT DO NOTHING lets the unique index, not application
+        //    logic, decide what counts. The LEFT JOIN then labels each matched
+        //    tournament with whether this call was the one that inserted it.
+        //
+        //    Both result sets are needed (accepted vs. already-counted), but
+        //    they come from a single scan and a single copy of the window
+        //    predicate. Splitting this into two statements would give each its
+        //    own READ COMMITTED snapshot, so a tournament created between them
+        //    would be inserted into but missing from the status lookup — and
+        //    would get a ZINCRBY without its status ever being checked.
         //
         //    Deliberately not a per-row create() in a try/catch: a failed
         //    statement aborts the surrounding Postgres transaction. And not
         //    createMany({ skipDuplicates }): that returns a count, not the rows.
-        const inserted = await tx.$queryRaw<{ tournamentId: string }[]>`
-          INSERT INTO "TournamentBet" ("id", "tournamentId", "betId", "externalBetId", "playerId", "amount")
+        const matched = await tx.$queryRaw<MatchedTournamentRow[]>`
+          WITH matched AS (
+            SELECT t."id", t."status"
+            FROM "Tournament" t
+            WHERE t."startsAt" <= ${dto.createdAt}
+              AND t."endsAt" >= ${dto.createdAt}
+          ),
+          ins AS (
+            INSERT INTO "TournamentBet" ("id", "tournamentId", "betId", "externalBetId", "playerId", "amount")
+            SELECT
+              gen_random_uuid()::text,
+              m."id",
+              ${bet.id},
+              ${bet.externalBetId},
+              ${bet.playerId},
+              ${bet.amount}
+            FROM matched m
+            ON CONFLICT ("tournamentId", "externalBetId") DO NOTHING
+            RETURNING "tournamentId"
+          )
           SELECT
-            gen_random_uuid()::text,
-            t."id",
-            ${bet.id},
-            ${bet.externalBetId},
-            ${bet.playerId},
-            ${bet.amount}
-          FROM "Tournament" t
-          WHERE t."startsAt" <= ${dto.createdAt}
-            AND t."endsAt" >= ${dto.createdAt}
-          ON CONFLICT ("tournamentId", "externalBetId") DO NOTHING
-          RETURNING "tournamentId"
+            m."id" AS "tournamentId",
+            m."status"::text AS "status",
+            (i."tournamentId" IS NOT NULL) AS "inserted"
+          FROM matched m
+          LEFT JOIN ins i ON i."tournamentId" = m."id"
         `;
 
-        const accepted = inserted.map((row) => row.tournamentId);
-        const acceptedSet = new Set(accepted);
-        const alreadyCounted = matching
-          .map((t) => t.id)
-          .filter((id) => !acceptedSet.has(id));
-
-        // The ledger row is written regardless — it is the audit trail. But a
-        // tournament whose placements are already frozen must not have its live
-        // ZSET moved; surface that as a warning instead of silently dropping.
-        const statusById = new Map(matching.map((t) => [t.id, t.status]));
+        const accepted: string[] = [];
+        const alreadyCounted: string[] = [];
         const increments: ScoreIncrement[] = [];
-        for (const tournamentId of accepted) {
-          if (statusById.get(tournamentId) === TournamentStatus.FINALIZED) {
+
+        for (const row of matched) {
+          if (!row.inserted) {
+            alreadyCounted.push(row.tournamentId);
+            continue;
+          }
+          accepted.push(row.tournamentId);
+
+          // The ledger row is written regardless — it is the audit trail. But a
+          // tournament whose placements are already frozen must not have its
+          // live ZSET moved; surface that as a warning instead of silently
+          // dropping it.
+          if (row.status === TournamentStatus.FINALIZED) {
             this.logger.warn(
               `Late bet ${bet.externalBetId} landed in already-finalized ` +
-                `tournament ${tournamentId}; placements unchanged`,
+                `tournament ${row.tournamentId}; placements unchanged`,
             );
             continue;
           }
           increments.push({
-            tournamentId,
+            tournamentId: row.tournamentId,
             playerId: bet.playerId,
             amount: bet.amount,
           });
@@ -118,7 +141,7 @@ export class BetsService {
         return { bet, accepted, alreadyCounted, increments };
       });
 
-    // 4. Only after the ledger has committed. If the process dies here Redis
+    // 3. Only after the ledger has committed. If the process dies here Redis
     //    reads low until the next rebuild — Postgres still holds the truth.
     await this.leaderboard.applyIncrements(increments);
 
