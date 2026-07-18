@@ -7,7 +7,7 @@ import { REDIS_CLIENT, RedisModule } from '../redis/redis.module';
 import { leaderboardKey } from '../tournaments/leaderboard.keys';
 import { LeaderboardService } from '../tournaments/leaderboard.service';
 import { SnapshotService } from '../tournaments/snapshot.service';
-import { BetsService } from './bets.service';
+import { BetsService, IngestResult } from './bets.service';
 import { CreateBetDto } from './dto/create-bet.dto';
 
 /**
@@ -110,8 +110,19 @@ describe('BetsService (integration)', () => {
     const results = await Promise.allSettled(
       Array.from({ length: 5 }, () => bets.ingest(betDto())),
     );
-    const succeeded = results.filter((r) => r.status === 'fulfilled');
-    expect(succeeded.length).toBeGreaterThan(0);
+
+    // The contract is that a duplicate is a *success*. A caller that raced and
+    // got a 500 would have to retry a bet that already counted, so "at least
+    // one succeeded" is not good enough — all five must succeed.
+    const rejected = results.filter((r) => r.status === 'rejected');
+    expect(rejected).toEqual([]);
+
+    const settled = results as PromiseFulfilledResult<IngestResult>[];
+    // Exactly one call did the insert; the other four saw it already counted.
+    expect(
+      settled.filter((r) => r.value.accepted.length === 1),
+    ).toHaveLength(1);
+    expect(settled.filter((r) => r.value.duplicate)).toHaveLength(4);
 
     expect(await prisma.tournamentBet.count()).toBe(1);
     expect(await scoreOf(tournament.id, 'player_42')).toBe('250');
