@@ -2,10 +2,6 @@
 
 Creates tournaments, ingests bet events, serves a live leaderboard from Redis, and freezes final placements to Postgres via a BullMQ job after `endsAt`.
 
-## The one idea worth reading
-
-**Postgres is the source of truth; Redis is a derived, rebuildable cache.**
-
 ## Running
 
 ```bash
